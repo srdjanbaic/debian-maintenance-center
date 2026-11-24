@@ -1,0 +1,267 @@
+#!/bin/bash
+
+# Debian Maintenance Center
+# Debian 13 / XFCE
+
+START_TIME=$(date +%s)
+FAILED=0
+WARNINGS=0
+REBOOT_REQUIRED=0
+
+LOGDIR="$HOME/.local/state/debian-maintenance-center"
+mkdir -p "$LOGDIR"
+
+LOGFILE="$LOGDIR/maintenance-$(date +%Y-%m-%d_%H-%M-%S).log"
+
+# Enable colors only in a compatible interactive terminal.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RESET='\033[0m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    RED='\033[1;31m'
+    GREEN='\033[1;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[1;34m'
+    CYAN='\033[1;36m'
+    WHITE='\033[1;37m'
+else
+    RESET='' BOLD='' DIM='' RED='' GREEN=''
+    YELLOW='' BLUE='' CYAN='' WHITE=''
+fi
+
+# Display output normally while writing a color-free log.
+exec > >(tee >(sed -u -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' >> "$LOGFILE")) 2>&1
+
+show_header() {
+    clear
+    printf "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║                                                      ║"
+    echo "║             DEBIAN MAINTENANCE CENTER                ║"
+    echo "║                                                      ║"
+    echo "║              SYSTEM CARE & OPTIMIZATION              ║"
+    echo "║                                                      ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    printf "${RESET}\n"
+
+    printf "${DIM}System:${RESET}  Debian GNU/Linux\n"
+    printf "${DIM}Host:${RESET}    %s\n" "$(hostname)"
+    printf "${DIM}Kernel:${RESET}  %s\n" "$(uname -r)"
+    printf "${DIM}Started:${RESET} %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "${DIM}Log:${RESET}     %s\n" "$LOGFILE"
+    echo
+}
+
+section() {
+    echo
+    printf "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+    printf "${BLUE}${BOLD}  %s${RESET}\n" "$1"
+    printf "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+}
+
+success() {
+    printf "${GREEN}${BOLD}  [OK]${RESET} %s\n" "$1"
+}
+
+warning() {
+    printf "${YELLOW}${BOLD}  [WARNING]${RESET} %s\n" "$1"
+}
+
+error() {
+    printf "${RED}${BOLD}  [ERROR]${RESET} %s\n" "$1"
+}
+
+run_step() {
+    local NUMBER="$1"
+    local DESCRIPTION="$2"
+    shift 2
+
+    echo
+    printf "${CYAN}${BOLD}  [%s] %s${RESET}\n" "$NUMBER" "$DESCRIPTION"
+    printf "${DIM}  ----------------------------------------------------${RESET}\n"
+
+    if "$@"; then
+        success "Operation completed successfully."
+    else
+        local STATUS=$?
+        error "Operation failed. Exit code: $STATUS"
+        FAILED=1
+    fi
+}
+
+optional_step() {
+    local DESCRIPTION="$1"
+    shift
+
+    echo
+    printf "${CYAN}${BOLD}  %s${RESET}\n" "$DESCRIPTION"
+    printf "${DIM}  ----------------------------------------------------${RESET}\n"
+
+    if "$@"; then
+        success "Operation completed."
+    else
+        warning "Operation could not be completed."
+        WARNINGS=1
+    fi
+}
+
+disk_report() {
+    df -hT -x tmpfs -x devtmpfs -x squashfs
+}
+
+show_header
+
+printf "${YELLOW}${BOLD}  AUTHENTICATION${RESET}\n"
+echo "  Administrator privileges are required."
+echo
+
+sudo -v || exit 1
+
+ROOT_BEFORE=$(df -B1 --output=avail / | awk 'NR==2 {print $1}')
+
+section "DISK USAGE BEFORE MAINTENANCE"
+disk_report
+
+section "SYSTEM MAINTENANCE"
+
+run_step "1/8" "Updating package repositories" \
+    sudo apt-get update
+
+run_step "2/8" "Upgrading the complete system" \
+    sudo apt-get full-upgrade -y
+
+run_step "3/8" "Removing unnecessary packages" \
+    sudo apt-get autoremove --purge -y
+
+run_step "4/8" "Cleaning obsolete packages" \
+    sudo apt-get autoclean
+
+run_step "5/8" "Cleaning APT package cache" \
+    sudo apt-get clean
+
+run_step "6/8" "Cleaning system journals (older than 14 days)" \
+    sudo journalctl --vacuum-time=14d
+
+run_step "7/8" "Checking unfinished package installations" \
+    sudo dpkg --audit
+
+run_step "8/8" "Checking package dependencies" \
+    sudo apt-get check
+
+section "SSD / NVMe MAINTENANCE"
+
+if command -v lsblk >/dev/null 2>&1; then
+    DISCARD_SUPPORTED=$(lsblk -dn -o ROTA,DISC-MAX 2>/dev/null |
+        awk '$1=="0" && $2 !~ /^0(B)?$/ {found=1}
+        END {print found+0}')
+
+    if [ "$DISCARD_SUPPORTED" -eq 1 ]; then
+        success "Non-rotational storage with discard support detected."
+        optional_step "Running filesystem TRIM" sudo fstrim -av
+    else
+        warning "No suitable non-rotational storage detected. TRIM skipped."
+    fi
+else
+    warning "lsblk is unavailable. TRIM detection skipped."
+    WARNINGS=1
+fi
+
+section "DISK USAGE AFTER MAINTENANCE"
+disk_report
+
+ROOT_AFTER=$(df -B1 --output=avail / | awk 'NR==2 {print $1}')
+
+section "DISK SPACE SUMMARY"
+
+if [[ "$ROOT_BEFORE" =~ ^[0-9]+$ ]] &&
+   [[ "$ROOT_AFTER" =~ ^[0-9]+$ ]]; then
+
+    SPACE_CHANGE=$((ROOT_AFTER - ROOT_BEFORE))
+
+    if [ "$SPACE_CHANGE" -gt 0 ]; then
+        printf "${GREEN}  Space freed: %s${RESET}\n" \
+            "$(numfmt --to=iec --suffix=B "$SPACE_CHANGE")"
+    elif [ "$SPACE_CHANGE" -lt 0 ]; then
+        SPACE_USED=$((-SPACE_CHANGE))
+        printf "${YELLOW}  Space increase: %s${RESET}\n" \
+            "$(numfmt --to=iec --suffix=B "$SPACE_USED")"
+    else
+        echo "  No net space change on root filesystem."
+    fi
+else
+    warning "Unable to calculate disk space change."
+    WARNINGS=1
+fi
+
+section "REBOOT STATUS"
+
+if [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]; then
+    REBOOT_REQUIRED=1
+fi
+
+RUNNING_KERNEL=$(uname -r)
+
+LATEST_KERNEL=$(find /boot -maxdepth 1 -type f \
+    -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+    sed 's/^vmlinuz-//' | sort -V | tail -n 1)
+
+echo "  Running kernel: $RUNNING_KERNEL"
+
+if [ -n "$LATEST_KERNEL" ]; then
+    echo "  Latest installed kernel image: $LATEST_KERNEL"
+
+    if [ "$LATEST_KERNEL" != "$RUNNING_KERNEL" ]; then
+        REBOOT_REQUIRED=1
+    fi
+fi
+
+if [ "$REBOOT_REQUIRED" -eq 1 ]; then
+    warning "A system restart is recommended."
+else
+    success "No reboot requirement detected."
+fi
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+HOURS=$((DURATION / 3600))
+MINUTES=$(((DURATION % 3600) / 60))
+SECONDS_REMAINING=$((DURATION % 60))
+
+section "MAINTENANCE REPORT"
+
+printf "  Execution time:  %02d:%02d:%02d\n" \
+    "$HOURS" "$MINUTES" "$SECONDS_REMAINING"
+
+printf "  Failed steps:    %s\n" "$FAILED"
+printf "  Warnings:        %s\n" "$WARNINGS"
+
+if [ "$FAILED" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+    printf "\n${GREEN}${BOLD}"
+    echo "  ✓ MAINTENANCE COMPLETED SUCCESSFULLY"
+    printf "${RESET}"
+elif [ "$FAILED" -eq 0 ]; then
+    printf "\n${YELLOW}${BOLD}"
+    echo "  ! MAINTENANCE COMPLETED WITH WARNINGS"
+    printf "${RESET}"
+else
+    printf "\n${RED}${BOLD}"
+    echo "  ✗ MAINTENANCE COMPLETED WITH ERRORS"
+    printf "${RESET}"
+fi
+
+if [ "$REBOOT_REQUIRED" -eq 1 ]; then
+    printf "\n${YELLOW}${BOLD}  RESTART RECOMMENDED${RESET}\n"
+    echo "  Please restart your computer when convenient."
+fi
+
+echo
+printf "${DIM}  Log saved to:${RESET}\n"
+echo "  $LOGFILE"
+echo
+printf "${CYAN}${BOLD}  Thank you for using Debian Maintenance Center.${RESET}\n"
+echo
+
+read -r -p "  Press ENTER to close this window..."
+
+exit "$FAILED"

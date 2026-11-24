@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Debian Maintenance Center
+GenericName=System Maintenance
+Comment=Update, clean and maintain Debian Linux
+Exec=debian-maintenance-center
+Icon=debian-maintenance-center
+Terminal=true
+Categories=System;
+StartupNotify=true
